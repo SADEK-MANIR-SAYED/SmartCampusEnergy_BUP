@@ -122,7 +122,7 @@ def _validate_single(
     applies = raw.get("applies")
     if applies is None:
         raise GuardrailError("Missing 'applies' field", note_index)
-    if isinstance(applies, bool) is False or not isinstance(applies, bool):
+    if not isinstance(applies, bool):
         raise GuardrailError(
             f"'applies' must be strict boolean (True/False), got {type(applies).__name__} ({applies!r})",
             note_index,

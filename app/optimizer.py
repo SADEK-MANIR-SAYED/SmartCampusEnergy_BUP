@@ -291,12 +291,12 @@ def optimize(
             charge_amt = 0.0
             discharge_amt = 0.0
 
+        # Battery transition - use exact arithmetic from action amounts (no clamping)
+        e_after = current_battery_e + charge_amt - discharge_amt
+
         # Exact energy balance: grid = demand + charge - solar - discharge
         grid_needed = max(0.0, hr.demand_kwh + charge_amt - s - discharge_amt)
 
-        # Battery transition
-        e_after = current_battery_e + charge_amt - discharge_amt
-        e_after = max(battery.minimum_energy_kwh, min(e_after, battery.capacity_kwh))
         current_battery_e = e_after
 
         hourly_plan.append({

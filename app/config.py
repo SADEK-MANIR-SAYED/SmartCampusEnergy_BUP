@@ -6,7 +6,7 @@ load_dotenv()
 
 # Gemini API configuration
 GEMINI_API_KEY: str = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL: str = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
+GEMINI_MODEL: str = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
 GEMINI_TIMEOUT: int = int(os.environ.get("GEMINI_TIMEOUT", "25"))
 
 # Server configuration

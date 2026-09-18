@@ -28,7 +28,7 @@ def _get_model_name() -> str:
     return (
         getattr(config, "GEMINI_MODEL", "")
         or os.environ.get("GEMINI_MODEL", "")
-        or "gemini-3.6-flash"
+        or "gemini-2.0-flash"
     )
 
 
@@ -105,7 +105,7 @@ def _call_gemini_api(user_prompt: str, max_retries: int = 3) -> str:
     primary_model = _get_model_name()
     # List candidate models to try in order if transient failures occur
     candidate_models = [primary_model]
-    for fallback in ["gemini-3.5-flash", "gemini-flash-latest"]:
+    for fallback in ["gemini-1.5-flash", "gemini-2.0-flash-lite"]:
         if fallback not in candidate_models:
             candidate_models.append(fallback)
 
