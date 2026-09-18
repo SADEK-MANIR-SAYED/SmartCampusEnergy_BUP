@@ -192,12 +192,12 @@ def test_duplicate_hours_in_directive():
         validate_and_normalize(raw, 1, BATTERY_CAPACITY)
 
 
-def test_hours_ascending_enforced():
-    """Hours can be in any order from LLM; guardrails should sort them."""
+def test_hours_must_be_ascending():
+    """Unsorted hours must be REJECTED, not silently sorted."""
     raw = [{"note_index": 0, "applies": True, "directive_type": "no_charge_window",
             "structured_adjustment": {"hours": [4, 3, 2]}, "explanation": "x"}]
-    result = validate_and_normalize(raw, 1, BATTERY_CAPACITY)
-    assert result[0].structured_adjustment["hours"] == [2, 3, 4]
+    with pytest.raises(GuardrailError, match="ascending"):
+        validate_and_normalize(raw, 1, BATTERY_CAPACITY)
 
 
 def test_missing_hours_field():
@@ -226,16 +226,45 @@ def test_malformed_not_a_list():
         validate_and_normalize({"note_index": 0}, 1, BATTERY_CAPACITY)
 
 
-def test_no_op_with_non_null_adjustment_normalized():
-    """no_op with a non-null adjustment should be normalized to null (not raise)."""
+def test_no_op_with_non_null_adjustment_rejected():
+    """no_op with a non-null adjustment must be REJECTED per spec."""
     raw = [{"note_index": 0, "applies": False, "directive_type": "no_op",
             "structured_adjustment": {"hours": [1]}, "explanation": "x"}]
-    result = validate_and_normalize(raw, 1, BATTERY_CAPACITY)
-    assert result[0].structured_adjustment is None
+    with pytest.raises(GuardrailError, match="structured_adjustment=null"):
+        validate_and_normalize(raw, 1, BATTERY_CAPACITY)
 
 
 def test_hours_empty_list():
     raw = [{"note_index": 0, "applies": True, "directive_type": "no_charge_window",
             "structured_adjustment": {"hours": []}, "explanation": "x"}]
     with pytest.raises(GuardrailError, match="empty"):
+        validate_and_normalize(raw, 1, BATTERY_CAPACITY)
+
+
+def test_reject_boolean_and_float_hours():
+    """Hours must be strict integers, rejecting booleans, floats, strings."""
+    # Boolean hour
+    raw1 = [{"note_index": 0, "applies": True, "directive_type": "no_charge_window",
+             "structured_adjustment": {"hours": [True, 2]}, "explanation": "x"}]
+    with pytest.raises(GuardrailError, match="strict integer"):
+        validate_and_normalize(raw1, 1, BATTERY_CAPACITY)
+
+    # Float hour
+    raw2 = [{"note_index": 0, "applies": True, "directive_type": "no_charge_window",
+             "structured_adjustment": {"hours": [13.5]}, "explanation": "x"}]
+    with pytest.raises(GuardrailError, match="strict integer"):
+        validate_and_normalize(raw2, 1, BATTERY_CAPACITY)
+
+    # String hour
+    raw3 = [{"note_index": 0, "applies": True, "directive_type": "no_charge_window",
+             "structured_adjustment": {"hours": ["13"]}, "explanation": "x"}]
+    with pytest.raises(GuardrailError, match="strict integer"):
+        validate_and_normalize(raw3, 1, BATTERY_CAPACITY)
+
+
+def test_reject_string_applies():
+    """applies must be strict boolean."""
+    raw = [{"note_index": 0, "applies": "true", "directive_type": "no_charge_window",
+            "structured_adjustment": {"hours": [2, 3]}, "explanation": "x"}]
+    with pytest.raises(GuardrailError, match="strict boolean"):
         validate_and_normalize(raw, 1, BATTERY_CAPACITY)

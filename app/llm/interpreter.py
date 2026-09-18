@@ -28,7 +28,7 @@ def _get_model_name() -> str:
     return (
         getattr(config, "GEMINI_MODEL", "")
         or os.environ.get("GEMINI_MODEL", "")
-        or "gemini-2.0-flash"
+        or "gemini-3.6-flash"
     )
 
 
@@ -97,12 +97,17 @@ def interpret_notes(
     return _parse_json_response(raw_response_text)
 
 
-def _call_gemini_api(user_prompt: str, max_retries: int = 2) -> str:
+def _call_gemini_api(user_prompt: str, max_retries: int = 3) -> str:
     """
-    Execute single batch request to Gemini with retry logic for transient errors.
+    Execute request to Gemini with fallback models and retry logic for transient errors.
     """
     client = _get_client()
-    model = _get_model_name()
+    primary_model = _get_model_name()
+    # List candidate models to try in order if transient failures occur
+    candidate_models = [primary_model]
+    for fallback in ["gemini-3.5-flash", "gemini-flash-latest"]:
+        if fallback not in candidate_models:
+            candidate_models.append(fallback)
 
     gen_config = types.GenerateContentConfig(
         system_instruction=SYSTEM_PROMPT,
@@ -112,33 +117,41 @@ def _call_gemini_api(user_prompt: str, max_retries: int = 2) -> str:
 
     last_error: Exception | None = None
 
-    for attempt in range(max_retries + 1):
-        try:
-            response = client.models.generate_content(
-                model=model,
-                contents=user_prompt,
-                config=gen_config,
-            )
-            if not response.text:
-                raise RuntimeError("Gemini API returned an empty text response")
-            return response.text
-        except Exception as e:
-            last_error = e
-            if attempt < max_retries:
-                backoff_seconds = 1.5 * (attempt + 1)
-                logger.warning(
-                    "Gemini API attempt %d/%d failed: %s. Retrying in %.1fs...",
-                    attempt + 1,
-                    max_retries + 1,
-                    e,
-                    backoff_seconds,
+    for model in candidate_models:
+        for attempt in range(max_retries):
+            try:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=user_prompt,
+                    config=gen_config,
                 )
-                time.sleep(backoff_seconds)
-            else:
-                logger.error("All %d Gemini API attempts failed: %s", max_retries + 1, e)
+                if not response.text:
+                    raise RuntimeError(f"Gemini API ({model}) returned an empty text response")
+                return response.text
+            except Exception as e:
+                last_error = e
+                err_str = str(e).lower()
+                # 404 means model unavailable; try next model immediately
+                if "404" in err_str or "not_found" in err_str:
+                    logger.warning("Model %s returned 404 NOT_FOUND. Trying fallback model...", model)
+                    break
+
+                if attempt < max_retries - 1:
+                    backoff_seconds = 1.0 * (2 ** attempt)  # 1s, 2s, 4s exponential backoff
+                    logger.warning(
+                        "Gemini API model %s attempt %d/%d failed: %s. Retrying in %.1fs...",
+                        model,
+                        attempt + 1,
+                        max_retries,
+                        e,
+                        backoff_seconds,
+                    )
+                    time.sleep(backoff_seconds)
+                else:
+                    logger.warning("All %d attempts failed for model %s: %s", max_retries, model, e)
 
     raise RuntimeError(
-        f"Gemini API call failed after {max_retries + 1} attempts: {last_error}"
+        f"Gemini API call failed for all candidate models: {last_error}"
     ) from last_error
 
 
