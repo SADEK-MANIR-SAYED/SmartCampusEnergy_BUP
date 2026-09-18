@@ -1,0 +1,11 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-v --tb=short"
+asyncio_mode = "auto"
+filterwarnings = [
+    "ignore::DeprecationWarning:anyio",
+    "ignore::DeprecationWarning:starlette",
+    "ignore::DeprecationWarning:pulp",
+    "ignore::starlette.testclient.StarletteDeprecationWarning",
+]
