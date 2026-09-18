@@ -27,7 +27,7 @@ from app.schemas import BatteryConfig, HourRecord
 
 logger = logging.getLogger(__name__)
 
-TINY = 1e-6  # internal LP threshold
+TINY = 1e-5  # internal LP threshold for actions
 
 
 @dataclass
@@ -121,41 +121,41 @@ def optimize(
         factor = directive_constraints.solar_factors.get(hr.hour, 1.0)
         effective_solar.append(hr.solar_kwh * factor)
 
-    # ── Build LP model using PuLP 3.x API ─────────────────────────────────────
+    # ── Build LP model using standard PuLP API ──────────────────────────────
     prob = pulp.LpProblem("GridWise_Energy_Schedule", pulp.LpMinimize)
 
-    # Decision variables using new API (prob.add_variable)
+    # Decision variables using standard pulp.LpVariable
     # grid[h]: grid import at hour h (kWh)
     grid = [
-        prob.add_variable(f"grid_{h}", lowBound=0)
+        pulp.LpVariable(f"grid_{h}", lowBound=0)
         for h in range(N)
     ]
 
     # solar_used[h]: solar used at hour h (kWh)
     solar_used = [
-        prob.add_variable(f"solar_used_{h}", lowBound=0, upBound=effective_solar[h])
+        pulp.LpVariable(f"solar_used_{h}", lowBound=0, upBound=effective_solar[h])
         for h in range(N)
     ]
 
     # charge_kwh[h]: energy charged into battery at hour h
     charge_kwh = [
-        prob.add_variable(f"charge_{h}", lowBound=0, upBound=battery.max_charge_kwh_per_hour)
+        pulp.LpVariable(f"charge_{h}", lowBound=0, upBound=battery.max_charge_kwh_per_hour)
         for h in range(N)
     ]
 
     # discharge_kwh[h]: energy discharged from battery at hour h
     discharge_kwh = [
-        prob.add_variable(f"discharge_{h}", lowBound=0, upBound=battery.max_discharge_kwh_per_hour)
+        pulp.LpVariable(f"discharge_{h}", lowBound=0, upBound=battery.max_discharge_kwh_per_hour)
         for h in range(N)
     ]
 
     # Binary variables to enforce charge/discharge exclusivity
-    charge_b = [prob.add_variable(f"charge_b_{h}", cat="Binary") for h in range(N)]
-    discharge_b = [prob.add_variable(f"discharge_b_{h}", cat="Binary") for h in range(N)]
+    charge_b = [pulp.LpVariable(f"charge_b_{h}", cat="Binary") for h in range(N)]
+    discharge_b = [pulp.LpVariable(f"discharge_b_{h}", cat="Binary") for h in range(N)]
 
     # battery_e[h]: battery energy AFTER hour h
     battery_e = [
-        prob.add_variable(
+        pulp.LpVariable(
             f"battery_e_{h}",
             lowBound=battery.minimum_energy_kwh,
             upBound=battery.capacity_kwh,
@@ -237,7 +237,7 @@ def optimize(
 
     solver = pulp.PULP_CBC_CMD(
         msg=0,        # suppress CBC output
-        timeLimit=25, # seconds
+        timeLimit=20, # seconds timeout
         gapRel=0.0001, # 0.01% optimality gap
     )
 
@@ -261,47 +261,56 @@ def optimize(
 
     # ── Extract solution ───────────────────────────────────────────────────────
     hourly_plan = []
-    total_grid = 0.0
-    total_cost = 0.0
+    current_battery_e = battery.initial_energy_kwh
 
     for h in range(N):
         hr = hrs[h]
-        g = max(0.0, pulp.value(grid[h]) or 0.0)
-        s = max(0.0, pulp.value(solar_used[h]) or 0.0)
-        ch = max(0.0, pulp.value(charge_kwh[h]) or 0.0)
-        dc = max(0.0, pulp.value(discharge_kwh[h]) or 0.0)
-        e_after = pulp.value(battery_e[h]) or 0.0
-        cb_val = round(pulp.value(charge_b[h]) or 0.0)
-        db_val = round(pulp.value(discharge_b[h]) or 0.0)
+        ch_raw = max(0.0, float(pulp.value(charge_kwh[h]) or 0.0))
+        dc_raw = max(0.0, float(pulp.value(discharge_kwh[h]) or 0.0))
+        cb_val = round(float(pulp.value(charge_b[h]) or 0.0))
+        db_val = round(float(pulp.value(discharge_b[h]) or 0.0))
+        s_raw = max(0.0, float(pulp.value(solar_used[h]) or 0.0))
+
+        # Clamp solar to effective limit
+        s = min(s_raw, effective_solar[h])
 
         # Determine battery action from binary variables and amounts
-        if cb_val == 1 and ch > TINY:
+        if cb_val == 1 and ch_raw > TINY:
             action = "charge"
-            bat_kwh = ch
-        elif db_val == 1 and dc > TINY:
+            bat_kwh = min(ch_raw, battery.max_charge_kwh_per_hour)
+            discharge_amt = 0.0
+            charge_amt = bat_kwh
+        elif db_val == 1 and dc_raw > TINY:
             action = "discharge"
-            bat_kwh = dc
+            bat_kwh = min(dc_raw, battery.max_discharge_kwh_per_hour)
+            charge_amt = 0.0
+            discharge_amt = bat_kwh
         else:
             action = "idle"
             bat_kwh = 0.0
+            charge_amt = 0.0
+            discharge_amt = 0.0
 
-        # Clamp solar to effective limit (numerical safety)
-        s = min(s, effective_solar[h])
-        g = max(0.0, g)
+        # Exact energy balance: grid = demand + charge - solar - discharge
+        grid_needed = max(0.0, hr.demand_kwh + charge_amt - s - discharge_amt)
+
+        # Battery transition
+        e_after = current_battery_e + charge_amt - discharge_amt
         e_after = max(battery.minimum_energy_kwh, min(e_after, battery.capacity_kwh))
-
-        total_grid += g
-        total_cost += g * hr.tariff_bdt_per_kwh
+        current_battery_e = e_after
 
         hourly_plan.append({
             "hour": hr.hour,
-            "grid_kwh": g,
+            "grid_kwh": grid_needed,
             "solar_used_kwh": s,
             "battery_action": action,
             "battery_kwh": bat_kwh,
             "battery_energy_after_kwh": e_after,
         })
 
+    # Recalculate totals directly from hourly plan
+    total_grid = sum(entry["grid_kwh"] for entry in hourly_plan)
+    total_cost = sum(entry["grid_kwh"] * hrs[entry["hour"]].tariff_bdt_per_kwh for entry in hourly_plan)
     peak_grid = max(entry["grid_kwh"] for entry in hourly_plan)
 
     return OptimizedSchedule(

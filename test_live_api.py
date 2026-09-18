@@ -5,7 +5,10 @@ import os
 import urllib.request
 import urllib.error
 
-BASE_URL = "http://localhost:8000"
+from dotenv import load_dotenv
+load_dotenv()
+
+BASE_URL = f"http://localhost:{os.environ.get('PORT', '8000')}"
 
 def get(path):
     url = BASE_URL + path

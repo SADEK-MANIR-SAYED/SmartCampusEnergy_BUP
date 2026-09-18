@@ -1,34 +1,54 @@
-"""Gemini LLM interpreter for operator notes."""
+"""Gemini LLM interpreter for operator notes using google-genai SDK."""
 from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from typing import Any
+
+from google import genai
+from google.genai import types
 
 from app import config
 from app.llm.prompt import SYSTEM_PROMPT, build_user_prompt
 
 logger = logging.getLogger(__name__)
 
-# ─── Lazy-initialized Gemini client ───────────────────────────────────────────
-_client = None
+_client: genai.Client | None = None
 
 
-def _get_client():
-    """Lazily initialize the Gemini client."""
+def _get_api_key() -> str:
+    """Retrieve Gemini API key from app.config or environment."""
+    return getattr(config, "GEMINI_API_KEY", "") or os.environ.get("GEMINI_API_KEY", "")
+
+
+def _get_model_name() -> str:
+    """Retrieve Gemini model name from app.config or environment."""
+    return (
+        getattr(config, "GEMINI_MODEL", "")
+        or os.environ.get("GEMINI_MODEL", "")
+        or "gemini-3.6-flash"
+    )
+
+
+def _get_client() -> genai.Client:
+    """Lazily initialize and return the google-genai Client."""
     global _client
+    api_key = _get_api_key()
+    if not api_key:
+        raise RuntimeError(
+            "GEMINI_API_KEY is not set. Please configure it in your environment or .env file."
+        )
+
     if _client is None:
         try:
-            from google import genai  # type: ignore
-            _client = genai.Client(api_key=config.GEMINI_API_KEY)
+            _client = genai.Client(api_key=api_key)
         except Exception as e:
-            logger.error("Failed to initialize Gemini client: %s", e)
-            raise RuntimeError(f"Gemini client initialization failed: {e}") from e
+            logger.error("Failed to initialize google-genai Client: %s", e)
+            raise RuntimeError(f"Failed to initialize Gemini client: {e}") from e
     return _client
 
-
-# ─── Interpreter ──────────────────────────────────────────────────────────────
 
 def interpret_notes(
     scenario_id: str,
@@ -37,16 +57,19 @@ def interpret_notes(
     battery_minimum_kwh: float,
 ) -> list[dict[str, Any]]:
     """
-    Use Gemini to interpret operator notes into directives.
+    Interpret operator notes into structured energy directives using Gemini.
 
-    Returns a list of raw directive interpretation dicts (pre-guardrail).
-    Raises RuntimeError on unrecoverable LLM failure.
+    Parameters:
+        scenario_id: Identifier for the scenario being scheduled.
+        operator_notes: List of raw natural language notes from the operator.
+        battery_capacity_kwh: Total battery storage capacity in kWh.
+        battery_minimum_kwh: Baseline battery reserve minimum in kWh.
+
+    Returns:
+        Raw list of interpretation dictionaries (prior to guardrail normalization).
     """
-    if not config.GEMINI_API_KEY:
-        raise RuntimeError(
-            "GEMINI_API_KEY environment variable is not set. "
-            "Please configure it before starting the service."
-        )
+    if not operator_notes:
+        return []
 
     user_prompt = build_user_prompt(
         scenario_id=scenario_id,
@@ -55,102 +78,131 @@ def interpret_notes(
         battery_minimum_kwh=battery_minimum_kwh,
     )
 
-    full_prompt = SYSTEM_PROMPT + "\n\n" + user_prompt
-
     logger.info(
-        "Calling Gemini for scenario=%s notes_count=%d",
-        scenario_id,
+        "Interpreting %d operator note(s) for scenario %s",
         len(operator_notes),
+        scenario_id,
     )
 
-    start = time.monotonic()
-    raw_text = _call_gemini(full_prompt)
-    elapsed = time.monotonic() - start
+    start_time = time.monotonic()
+    raw_response_text = _call_gemini_api(user_prompt)
+    elapsed = time.monotonic() - start_time
 
-    logger.info("Gemini call completed in %.2fs for scenario=%s", elapsed, scenario_id)
+    logger.info(
+        "Received Gemini response in %.2fs for scenario %s",
+        elapsed,
+        scenario_id,
+    )
 
-    parsed = _parse_gemini_response(raw_text, len(operator_notes))
-    return parsed
+    return _parse_json_response(raw_response_text)
 
 
-def _call_gemini(prompt: str) -> str:
-    """Call Gemini API with retry logic. Returns raw text response."""
+def _call_gemini_api(user_prompt: str, max_retries: int = 3) -> str:
+    """
+    Execute request to Gemini with fallback models and retry logic for transient errors.
+    """
     client = _get_client()
+    primary_model = _get_model_name()
+    # List candidate models to try in order if transient failures occur
+    candidate_models = [primary_model]
+    for fallback in ["gemini-3.5-flash", "gemini-flash-latest"]:
+        if fallback not in candidate_models:
+            candidate_models.append(fallback)
 
-    max_retries = 2
+    gen_config = types.GenerateContentConfig(
+        system_instruction=SYSTEM_PROMPT,
+        temperature=0.1,
+        response_mime_type="application/json",
+    )
+
     last_error: Exception | None = None
 
-    for attempt in range(max_retries + 1):
-        try:
-            response = client.models.generate_content(
-                model=config.GEMINI_MODEL,
-                contents=prompt,
-                config={
-                    "temperature": 0.1,  # Low temperature for determinism
-                    "response_mime_type": "application/json",
-                },
-            )
-            return response.text
-        except Exception as e:
-            last_error = e
-            if attempt < max_retries:
-                wait = 1.5 * (attempt + 1)
-                logger.warning(
-                    "Gemini attempt %d/%d failed: %s. Retrying in %.1fs...",
-                    attempt + 1,
-                    max_retries + 1,
-                    e,
-                    wait,
+    for model in candidate_models:
+        for attempt in range(max_retries):
+            try:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=user_prompt,
+                    config=gen_config,
                 )
-                time.sleep(wait)
-            else:
-                logger.error("All Gemini attempts failed: %s", e)
+                if not response.text:
+                    raise RuntimeError(f"Gemini API ({model}) returned an empty text response")
+                return response.text
+            except Exception as e:
+                last_error = e
+                err_str = str(e).lower()
+                # 404 means model unavailable; try next model immediately
+                if "404" in err_str or "not_found" in err_str:
+                    logger.warning("Model %s returned 404 NOT_FOUND. Trying fallback model...", model)
+                    break
 
-    raise RuntimeError(f"Gemini API call failed after {max_retries + 1} attempts: {last_error}")
+                if attempt < max_retries - 1:
+                    backoff_seconds = 1.0 * (2 ** attempt)  # 1s, 2s, 4s exponential backoff
+                    logger.warning(
+                        "Gemini API model %s attempt %d/%d failed: %s. Retrying in %.1fs...",
+                        model,
+                        attempt + 1,
+                        max_retries,
+                        e,
+                        backoff_seconds,
+                    )
+                    time.sleep(backoff_seconds)
+                else:
+                    logger.warning("All %d attempts failed for model %s: %s", max_retries, model, e)
+
+    raise RuntimeError(
+        f"Gemini API call failed for all candidate models: {last_error}"
+    ) from last_error
 
 
-def _parse_gemini_response(raw_text: str, expected_count: int) -> list[dict[str, Any]]:
+def _parse_json_response(raw_text: str) -> list[dict[str, Any]]:
     """
-    Parse and do minimal structural parsing of Gemini response.
-    Returns list of raw interpretation dicts.
-    Full validation is done by guardrails.
+    Parse the raw response text from Gemini into a list of dictionaries.
+    Strips markdown code fences if present and supports both direct arrays
+    and wrapped objects (e.g., {'interpretations': [...]}).
     """
-    if not raw_text or not raw_text.strip():
-        raise RuntimeError("Gemini returned an empty response")
+    cleaned_text = raw_text.strip()
 
     # Strip markdown code fences if present
-    text = raw_text.strip()
-    if text.startswith("```"):
-        lines = text.split("\n")
-        # Remove first and last lines (``` markers)
-        if lines[0].startswith("```"):
+    if cleaned_text.startswith("```"):
+        lines = cleaned_text.splitlines()
+        if lines and lines[0].startswith("```"):
             lines = lines[1:]
         if lines and lines[-1].strip() == "```":
             lines = lines[:-1]
-        text = "\n".join(lines)
+        cleaned_text = "\n".join(lines).strip()
 
     try:
-        data = json.loads(text)
-    except json.JSONDecodeError as e:
-        logger.error("Gemini response is not valid JSON: %s | Raw: %.200s", e, raw_text)
-        raise RuntimeError(f"Gemini returned invalid JSON: {e}") from e
+        data = json.loads(cleaned_text)
+    except json.JSONDecodeError as exc:
+        logger.error("Failed to decode JSON from Gemini: %s | Raw text: %.300s", exc, raw_text)
+        raise RuntimeError(f"Gemini returned invalid JSON: {exc}") from exc
 
-    # Extract interpretations from wrapper object or array
+    # If the response is already a JSON array, return directly
+    if isinstance(data, list):
+        return data
+
+    # If wrapped in a dictionary container, extract the list
     if isinstance(data, dict):
-        interps = data.get("interpretations", data.get("directive_interpretations", data.get("results", None)))
-        if interps is None:
-            # Maybe entire object is a single interpretation? Unlikely but handle
-            if "note_index" in data:
-                interps = [data]
-            else:
-                raise RuntimeError(f"Gemini response missing 'interpretations' key. Keys: {list(data.keys())}")
-    elif isinstance(data, list):
-        interps = data
-    else:
-        raise RuntimeError(f"Unexpected Gemini response type: {type(data)}")
+        for candidate_key in (
+            "interpretations",
+            "directive_interpretations",
+            "directives",
+            "results",
+            "data",
+        ):
+            candidate_val = data.get(candidate_key)
+            if isinstance(candidate_val, list):
+                return candidate_val
 
-    if not isinstance(interps, list):
-        raise RuntimeError(f"interpretations must be a list, got {type(interps)}")
+        # If model returned a single directive object instead of an array
+        if "note_index" in data or "directive_type" in data:
+            return [data]
 
-    logger.debug("Gemini returned %d interpretations (expected %d)", len(interps), expected_count)
-    return interps
+        raise RuntimeError(
+            f"Gemini response object missing interpretations array. Top-level keys: {list(data.keys())}"
+        )
+
+    raise RuntimeError(
+        f"Unexpected JSON response structure: expected list or dict, got {type(data).__name__}"
+    )

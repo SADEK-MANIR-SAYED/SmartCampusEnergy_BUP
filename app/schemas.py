@@ -1,6 +1,9 @@
 """Pydantic schemas for request and response validation."""
+
 from __future__ import annotations
+
 from typing import List, Literal, Optional
+
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
@@ -29,16 +32,19 @@ class BatteryConfig(BaseModel):
                 f"initial_energy_kwh ({self.initial_energy_kwh}) cannot exceed "
                 f"capacity_kwh ({self.capacity_kwh})"
             )
+
         if self.minimum_energy_kwh > self.capacity_kwh:
             raise ValueError(
                 f"minimum_energy_kwh ({self.minimum_energy_kwh}) cannot exceed "
                 f"capacity_kwh ({self.capacity_kwh})"
             )
+
         if self.initial_energy_kwh < self.minimum_energy_kwh:
             raise ValueError(
                 f"initial_energy_kwh ({self.initial_energy_kwh}) cannot be less than "
                 f"minimum_energy_kwh ({self.minimum_energy_kwh})"
             )
+
         return self
 
 
@@ -53,7 +59,9 @@ class OptimizeRequest(BaseModel):
     def validate_notes(cls, v: List[str]) -> List[str]:
         for i, note in enumerate(v):
             if not note or not note.strip():
-                raise ValueError(f"operator_notes[{i}] must be a non-empty string")
+                raise ValueError(
+                    f"operator_notes[{i}] must be a non-empty string"
+                )
         return v
 
     @field_validator("hours")
@@ -61,14 +69,19 @@ class OptimizeRequest(BaseModel):
     def validate_hours(cls, v: List[HourRecord]) -> List[HourRecord]:
         if len(v) != 24:
             raise ValueError("hours must contain exactly 24 entries")
+
         hours_seen = set()
+
         for rec in v:
             if rec.hour in hours_seen:
                 raise ValueError(f"Duplicate hour: {rec.hour}")
+
             hours_seen.add(rec.hour)
+
         if hours_seen != set(range(24)):
             missing = set(range(24)) - hours_seen
             raise ValueError(f"Missing hours: {sorted(missing)}")
+
         # Sort by hour for consistent processing
         return sorted(v, key=lambda h: h.hour)
 

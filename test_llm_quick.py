@@ -6,6 +6,9 @@ Requires GEMINI_API_KEY to be set.
 import os
 import sys
 
+from dotenv import load_dotenv
+load_dotenv()
+
 # Check for API key
 if not os.environ.get("GEMINI_API_KEY"):
     print("ERROR: GEMINI_API_KEY environment variable is not set.")
